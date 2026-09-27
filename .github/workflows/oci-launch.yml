@@ -60,8 +60,7 @@ jobs:
 
       - name: Notify success on Telegram
         if: steps.launch.outcome == 'success'
-        uses: yakubique/simple-telegram-send@v1
-        with:
-          token: ${{ secrets.TELEGRAM_TOKEN }}
-          to: ${{ secrets.TELEGRAM_CHAT_ID }}
-          message: "🎉 Phantom-Restored instance was just created! Check the OCI console for its IP."
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d text="🎉 Phantom-Restored instance was just created! Check the OCI console for its IP."
