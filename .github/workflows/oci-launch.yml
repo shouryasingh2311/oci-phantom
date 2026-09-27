@@ -29,12 +29,14 @@ jobs:
       - name: Skip if instance already exists
         id: check
         run: |
-          EXISTS=$(oci compute instance list \
+          COUNT=$(oci compute instance list \
             --compartment-id "${{ secrets.OCI_COMPARTMENT_ID }}" \
             --display-name "Phantom-Restored" \
-            --query "data[?\"lifecycle-state\"!='TERMINATED']" \
-            --raw-output 2>/dev/null || echo "[]")
-          if [ "$EXISTS" != "[]" ]; then
+            --query "length(data[?\"lifecycle-state\" != 'TERMINATED'])" \
+            --raw-output 2>/dev/null || echo "0")
+          if [ -z "$COUNT" ]; then COUNT=0; fi
+          echo "Instance count: $COUNT"
+          if [ "$COUNT" -gt 0 ]; then
             echo "found=true" >> "$GITHUB_OUTPUT"
           else
             echo "found=false" >> "$GITHUB_OUTPUT"
