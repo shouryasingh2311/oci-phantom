@@ -25,6 +25,7 @@ jobs:
           region=${{ secrets.OCI_REGION }}
           key_file=~/.oci/oci_api_key.pem
           EOF
+          chmod 600 ~/.oci/config
 
       - name: Skip if instance already exists
         id: check
@@ -47,6 +48,7 @@ jobs:
         id: launch
         continue-on-error: true
         run: |
+          printf '%s' "${{ secrets.OCI_SSH_KEY }}" | jq -Rs '{ssh_authorized_keys: .}' > metadata.json
           oci compute instance launch \
             --availability-domain "aKnM:AP-MUMBAI-1-AD-1" \
             --compartment-id "${{ secrets.OCI_COMPARTMENT_ID }}" \
@@ -56,7 +58,7 @@ jobs:
             --subnet-id "${{ secrets.OCI_SUBNET_ID }}" \
             --assign-public-ip true \
             --display-name "Phantom-Restored" \
-            --metadata "{\"ssh_authorized_keys\": \"${{ secrets.OCI_SSH_KEY }}\"}" \
+            --metadata file://metadata.json \
             2>&1 | tee launch_output.txt
           grep -q '"lifecycle-state": "PROVISIONING"' launch_output.txt
 
