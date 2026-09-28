@@ -2,12 +2,37 @@ name: OCI Instance Sniper
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '*/20 * * * *'
   workflow_dispatch:
 
+# Only one sniper runs at a time; a new one queues until the current one ends
+concurrency:
+  group: oci-sniper
+  cancel-in-progress: false
+
 jobs:
-  try-launch:
+  sniper:
     runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+      OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+      OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+      OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+      OCI_REGION: ${{ secrets.OCI_REGION }}
+      OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+      OCI_COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
+      OCI_BOOT_VOLUME_ID: ${{ secrets.OCI_BOOT_VOLUME_ID }}
+      OCI_SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
+      OCI_SSH_KEY: ${{ secrets.OCI_SSH_KEY }}
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      AD_NAME: "aKnM:AP-MUMBAI-1-AD-1"
+      INSTANCE_NAME: "Phantom-Restored"
+      HEARTBEAT_EVERY: "10"        # Telegram status message every N attempts (1 = every attempt)
+      CAPACITY_SLEEP: "120"        # seconds between attempts after "out of capacity"
+      RATELIMIT_SLEEP: "300"       # seconds to back off after a 429
+      MAX_RUNTIME_SECONDS: "20400" # stop looping after 340 min; the next queued run continues
     steps:
       - name: Install OCI CLI
         run: pip install oci-cli
@@ -15,56 +40,105 @@ jobs:
       - name: Configure OCI credentials
         run: |
           mkdir -p ~/.oci
-          echo "${{ secrets.OCI_PRIVATE_KEY }}" > ~/.oci/oci_api_key.pem
+          printf '%s\n' "$OCI_PRIVATE_KEY" > ~/.oci/oci_api_key.pem
           chmod 600 ~/.oci/oci_api_key.pem
           cat > ~/.oci/config << EOF
           [DEFAULT]
-          user=${{ secrets.OCI_USER_OCID }}
-          fingerprint=${{ secrets.OCI_FINGERPRINT }}
-          tenancy=${{ secrets.OCI_TENANCY_OCID }}
-          region=${{ secrets.OCI_REGION }}
-          key_file=~/.oci/oci_api_key.pem
+          user=$OCI_USER_OCID
+          fingerprint=$OCI_FINGERPRINT
+          tenancy=$OCI_TENANCY_OCID
+          region=$OCI_REGION
+          key_file=$HOME/.oci/oci_api_key.pem
           EOF
           chmod 600 ~/.oci/config
 
-      - name: Skip if instance already exists
-        id: check
+      - name: Sniper loop
         run: |
-          COUNT=$(oci compute instance list \
-            --compartment-id "${{ secrets.OCI_COMPARTMENT_ID }}" \
-            --display-name "Phantom-Restored" \
-            --query "length(data[?\"lifecycle-state\" != 'TERMINATED'])" \
-            --raw-output 2>/dev/null || echo "0")
-          if [ -z "$COUNT" ]; then COUNT=0; fi
-          echo "Instance count: $COUNT"
-          if [ "$COUNT" -gt 0 ]; then
-            echo "found=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "found=false" >> "$GITHUB_OUTPUT"
+          set +e
+
+          tg() {
+            curl -s -m 20 -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+              -d chat_id="$TELEGRAM_CHAT_ID" \
+              --data-urlencode text="$1" > /dev/null
+          }
+
+          instance_count() {
+            local c
+            c=$(oci compute instance list \
+              --compartment-id "$OCI_COMPARTMENT_ID" \
+              --display-name "$INSTANCE_NAME" \
+              --query "length(data[?\"lifecycle-state\" != 'TERMINATED'])" \
+              --raw-output 2>/dev/null)
+            [ -z "$c" ] && c=0
+            echo "$c"
+          }
+
+          if [ "$(instance_count)" -gt 0 ]; then
+            echo "Instance already exists. Nothing to do."
+            exit 0
           fi
 
-      - name: Attempt launch
-        if: steps.check.outputs.found == 'false'
-        id: launch
-        continue-on-error: true
-        run: |
-          printf '%s' "${{ secrets.OCI_SSH_KEY }}" | jq -Rs '{ssh_authorized_keys: .}' > metadata.json
-          oci compute instance launch \
-            --availability-domain "aKnM:AP-MUMBAI-1-AD-1" \
-            --compartment-id "${{ secrets.OCI_COMPARTMENT_ID }}" \
-            --shape "VM.Standard.A1.Flex" \
-            --shape-config '{"ocpus": 2, "memoryInGBs": 12}' \
-            --source-boot-volume-id "${{ secrets.OCI_BOOT_VOLUME_ID }}" \
-            --subnet-id "${{ secrets.OCI_SUBNET_ID }}" \
-            --assign-public-ip true \
-            --display-name "Phantom-Restored" \
-            --metadata file://metadata.json \
-            2>&1 | tee launch_output.txt
-          grep -q '"lifecycle-state": "PROVISIONING"' launch_output.txt
+          printf '%s' "$OCI_SSH_KEY" | jq -Rs '{ssh_authorized_keys: .}' > metadata.json
 
-      - name: Notify success on Telegram
-        if: steps.launch.outcome == 'success'
-        run: |
-          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
-            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
-            -d text="🎉 Phantom-Restored instance was just created! Check the OCI console for its IP."
+          # Alternates between two sizes; small requests often fit when big ones don't
+          SHAPES=("2 12" "1 6")
+          attempt=0
+          unexpected=0
+
+          while [ "$SECONDS" -lt "$MAX_RUNTIME_SECONDS" ]; do
+            attempt=$((attempt+1))
+            read -r OCPUS MEM <<< "${SHAPES[$(( (attempt-1) % ${#SHAPES[@]} ))]}"
+            echo "[$(date -u +%T)] Attempt $attempt (${OCPUS} OCPU / ${MEM} GB)"
+
+            timeout 180 oci compute instance launch \
+              --availability-domain "$AD_NAME" \
+              --compartment-id "$OCI_COMPARTMENT_ID" \
+              --shape "VM.Standard.A1.Flex" \
+              --shape-config "{\"ocpus\": $OCPUS, \"memoryInGBs\": $MEM}" \
+              --source-boot-volume-id "$OCI_BOOT_VOLUME_ID" \
+              --subnet-id "$OCI_SUBNET_ID" \
+              --assign-public-ip true \
+              --display-name "$INSTANCE_NAME" \
+              --metadata file://metadata.json \
+              > launch_output.txt 2>&1
+            cat launch_output.txt
+
+            REASON=$(grep -m1 '"message"' launch_output.txt | sed 's/^[^:]*: *"//; s/",\?$//')
+
+            if grep -q '"lifecycle-state": "PROVISIONING"' launch_output.txt; then
+              ID=$(grep -m1 '"id": "ocid1.instance' launch_output.txt | sed 's/.*"\(ocid1[^"]*\)".*/\1/')
+              tg "SUCCESS after $attempt attempts! ${INSTANCE_NAME} is provisioning (${OCPUS} OCPU / ${MEM} GB). Check the OCI console for its public IP. ${ID}"
+              exit 0
+            elif grep -qiE 'out of host capacity|out of capacity' launch_output.txt; then
+              unexpected=0
+              LAST="Out of host capacity"
+              SLEEP=$CAPACITY_SLEEP
+            elif grep -qE 'TooManyRequests|"status": 429' launch_output.txt; then
+              unexpected=0
+              LAST="Rate limited (429)"
+              SLEEP=$RATELIMIT_SLEEP
+            else
+              # Unclear response: the instance may still have been created, so check first
+              sleep 20
+              if [ "$(instance_count)" -gt 0 ]; then
+                tg "SUCCESS: ${INSTANCE_NAME} exists now (found after an unclear response on attempt $attempt). Check the OCI console."
+                exit 0
+              fi
+              unexpected=$((unexpected+1))
+              LAST="Unexpected: ${REASON:-see run logs}"
+              tg "Attempt $attempt hit an unexpected error ($unexpected/5): ${REASON:-see run logs}"
+              if [ "$unexpected" -ge 5 ]; then
+                tg "Stopping this run after 5 unexpected errors in a row. Check the Actions logs."
+                exit 1
+              fi
+              SLEEP=$RATELIMIT_SLEEP
+            fi
+
+            if [ "$attempt" -eq 1 ] || [ $((attempt % HEARTBEAT_EVERY)) -eq 0 ]; then
+              tg "Sniper alive - attempt $attempt at $(date -u +%H:%M) UTC. Last result: $LAST"
+            fi
+            sleep "$SLEEP"
+          done
+
+          tg "Run window finished after $attempt attempts with no capacity. The next run starts automatically."
+          exit 0
